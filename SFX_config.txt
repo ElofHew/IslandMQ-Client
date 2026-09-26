@@ -1,0 +1,35 @@
+﻿;!@Install@!UTF-8!
+InstallPath="C:\\Apps\\CIZMQC\\"
+Title="ClassIsland 通知发送器 安装程序"
+BeginPrompt="确定安装 ClassIsland 通知发送器 吗？"
+ExtractPathText="选择安装目录"
+ExtractDialogText="正在解压程序文件"
+CancelPrompt="确定要取消安装吗？"
+FinishMessage="安装完成"
+HelpText="需要帮助？"
+GUIFlags="1+2+4+8+32+64+128+256"
+MiscFlags="4"
+ExtractPathTitle="程序安装目录"
+ExtractTitle="正在安装"
+ErrorTitle="出错"
+WarningTitle="警告"
+Shortcut="Du,{C:\\Apps\\CIZMQC\\cizmqc.exe},{},{},{ClassIsland 通知发送器},{ClassIsland 通知发送器},{C:\\Apps\\CIZMQC\\},{},{}"
+Shortcut="Su,{C:\\Apps\\CIZMQC\\cizmqc.exe},{},{},{ClassIsland 通知发送器},{ClassIsland 通知发送器},{C:\\Apps\\CIZMQC},{},{}"
+;!@InstallEnd@!
+7zSFXBuilder_7zArchive=dist.7z
+7zSFXBuilder_SFXName=IslandMQ_Client_v1.0.exe
+7zSFXBuilder_SFXIcon=setup.ico
+7zSFXBuilder_UseDefMod=7zsd_LZMA2
+7zSFXBuilder_UPXCommands=--best --all-methods
+7zSFXBuilder_Res_FileVersion=1.0
+7zSFXBuilder_Res_CompanyName=Dan_Evan
+7zSFXBuilder_Res_Comments=
+7zSFXBuilder_Res_FileDescription=ClassIsland 通知发送器
+7zSFXBuilder_Res_ProductVersion=1.0
+7zSFXBuilder_Res_ProductName=ClassIsland 通知发送器
+7zSFXBuilder_Res_LegalCopyright=
+7zSFXBuilder_Res_LegalTrademarks=
+7zSFXBuilder_Res_InternalName=
+7zSFXBuilder_Res_OriginalFileName=
+7zSFXBuilder_Res_SpecialBuild=
+7zSFXBuilder_Res_PrivateBuild=

@@ -1,0 +1,1 @@
+pyinstaller --icon=./icon/icon.ico -w ./src/cizmqc.py
