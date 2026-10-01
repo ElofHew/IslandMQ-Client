@@ -8,6 +8,9 @@
 
 </div>
 
+>[!TIP]
+> 本项目由AI **全盘接手** 程序主体更新
+
 ## 项目背景
 
 众所周知，[ClassIsland](https://github.com/ClassIsland/ClassIsland)是一款功能强、可定制、跨平台，适用于班级多媒体屏幕的课表信息显示工具，可以一目了然地显示各种信息。（From ClassIsland Project Repository Page）
@@ -51,4 +54,4 @@
 
 ---
 
-&copy; 2026 ElofHew aka Dan_Evan All Rights Reserved.
+&copy; 2026 ElofHew All Rights Reserved.
