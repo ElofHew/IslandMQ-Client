@@ -15,16 +15,17 @@ from ipaddress import ip_address
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, messagebox, simpledialog, filedialog
 
 import zmq
 
 # ================= 元信息 =================
 APP_NAME = "ClassIslandNoticeSender"
 APP_TITLE = "ClassIsland 通知发送器"
-APP_VERSION = "1.0"
+APP_VERSION = "2.0"
 
 BATCH_TIMEOUT_MS = 5000
+BATCH_MAX_WORKERS = 10
 MAX_LOG_BYTES = 1_000_000
 
 
@@ -73,7 +74,7 @@ except Exception:
 # ================= 默认配置 =================
 DEFAULT_CONFIG = {
     "ip": "127.0.0.1",
-    "port": "5555",
+    "port": 5555,
     "title": "班主任通知",
     "mask_duration": 3.0,
     "overlay_duration": 5.0,
@@ -110,6 +111,14 @@ def clean_ip(ip: str) -> str:
     return ip
 
 
+def make_endpoint(ip: str, port: str) -> str:
+    """根据 IP 和端口构造 ZeroMQ endpoint，自动处理 IPv6 方括号。"""
+    ip = clean_ip(ip)
+    if ":" in ip:
+        return f"tcp://[{ip}]:{port}"
+    return f"tcp://{ip}:{port}"
+
+
 def load_config() -> dict:
     cfg = DEFAULT_CONFIG.copy()
     if CONFIG_FILE.exists():
@@ -135,8 +144,11 @@ def load_config() -> dict:
     cfg["ping_timeout_ms"] = _safe_int(
         cfg.get("ping_timeout_ms"), DEFAULT_CONFIG["ping_timeout_ms"]
     )
+    cfg["port"] = _safe_int(
+        cfg.get("port"), DEFAULT_CONFIG["port"]
+    )
 
-    for key in ("ip", "port", "title", "last_body", "default_class"):
+    for key in ("ip", "title", "last_body", "default_class"):
         if key not in cfg or cfg[key] is None:
             cfg[key] = DEFAULT_CONFIG[key]
         else:
@@ -260,13 +272,15 @@ def send_request_isolated(context: zmq.Context, endpoint: str,
         sock.connect(endpoint)
 
         payload = json.dumps(request, ensure_ascii=False)
-        logger.info(f"{prefix}发送 -> {endpoint}: {payload}")
+        logger.info(f"{prefix}发送 -> {endpoint} [command={request.get('command', '?')}]")
+        logger.debug(f"{prefix}完整请求: {payload}")
         sock.send_string(payload)
         reply = sock.recv_string()
-        logger.info(f"{prefix}收到 <- {endpoint}: {reply}")
+        logger.debug(f"{prefix}完整响应: {reply}")
 
         resp = json.loads(reply)
         if isinstance(resp, dict):
+            logger.info(f"{prefix}收到 <- {endpoint} [success={resp.get('success', False)}]")
             return resp.get("success", False), resp.get("message", reply)
         return True, str(resp)
 
@@ -304,6 +318,8 @@ class NoticeSenderApp:
 
         self.classlist = []
         self.batch_window = None
+        self._result_queue = queue.Queue()
+        self._worker_running = False
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -335,6 +351,12 @@ class NoticeSenderApp:
         )
         ttk.Button(class_frame, text="设为默认", command=self._set_default_class).grid(
             row=0, column=3, padx=3, pady=2
+        )
+        ttk.Button(class_frame, text="导入", command=self._import_classlist).grid(
+            row=0, column=4, padx=3, pady=2
+        )
+        ttk.Button(class_frame, text="导出", command=self._export_classlist).grid(
+            row=0, column=5, padx=3, pady=2
         )
         class_frame.columnconfigure(0, weight=1)
 
@@ -436,10 +458,10 @@ class NoticeSenderApp:
     def _collect_config(self) -> dict:
         cfg = {
             "ip": self.ip_var.get().strip(),
-            "port": self.port_var.get().strip(),
+            "port": _safe_int(self.port_var.get().strip(), DEFAULT_CONFIG["port"]),
             "title": self.title_var.get().strip(),
-            "mask_duration": self.mask_var.get().strip(),
-            "overlay_duration": self.overlay_var.get().strip(),
+            "mask_duration": _safe_float(self.mask_var.get().strip(), DEFAULT_CONFIG["mask_duration"]),
+            "overlay_duration": _safe_float(self.overlay_var.get().strip(), DEFAULT_CONFIG["overlay_duration"]),
             "timeout_ms": int(self.config.get("timeout_ms", DEFAULT_CONFIG["timeout_ms"])),
             "ping_timeout_ms": int(self.config.get("ping_timeout_ms", DEFAULT_CONFIG["ping_timeout_ms"])),
             "last_body": self.body_text.get("1.0", tk.END).strip(),
@@ -452,7 +474,7 @@ class NoticeSenderApp:
         default_key = self.config.get("default_class", "")
         key = f"{item['ip']}:{item['port']}"
         prefix = "★ " if key == default_key else "   "
-        return f"{prefix}{item['name']}  —  {item['ip']}:{item['port']}"
+        return f"{prefix}{item['name']}"
 
     def _refresh_classlist(self, select_index=None):
         """重新加载班级列表；保留用户当前的选择（如果仍然存在）"""
@@ -580,6 +602,89 @@ class NoticeSenderApp:
         logger.info(f"已设置默认班级: {item['name']} ({key})")
         self.status_var.set(f"⭐ 已设为默认班级: {item['name']}")
 
+    def _export_classlist(self):
+        if not self.classlist:
+            messagebox.showinfo("提示", "班级列表为空，没有可导出的内容。")
+            return
+        path = filedialog.asksaveasfilename(
+            title="导出班级列表",
+            defaultextension=".csv",
+            initialfile="classlist.csv",
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
+            parent=self.root,
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=CLASSLIST_FIELDS)
+                writer.writeheader()
+                for item in self.classlist:
+                    writer.writerow({
+                        "班级名称": item.get("name", ""),
+                        "IP": item.get("ip", ""),
+                        "端口": item.get("port", ""),
+                    })
+            logger.info(f"已导出班级列表到: {path} ({len(self.classlist)} 条)")
+            self.status_var.set(f"✅ 已导出 {len(self.classlist)} 个班级")
+            messagebox.showinfo("导出成功", f"已导出 {len(self.classlist)} 个班级到：\n{path}")
+        except Exception as e:
+            logger.warning(f"导出班级列表失败: {e}")
+            messagebox.showerror("导出失败", f"导出失败：{e}")
+
+    def _import_classlist(self):
+        path = filedialog.askopenfilename(
+            title="导入班级列表",
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
+            parent=self.root,
+        )
+        if not path:
+            return
+        try:
+            imported = []
+            with open(path, "r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    name = (row.get("班级名称") or "").strip()
+                    ip = clean_ip(row.get("IP") or "")
+                    port = (row.get("端口") or "").strip()
+                    if name and ip and port:
+                        try:
+                            ip_address(ip)
+                            if port.isdigit() and 1 <= int(port) <= 65535:
+                                imported.append({"name": name, "ip": ip, "port": port})
+                        except ValueError:
+                            continue
+        except Exception as e:
+            logger.warning(f"读取导入文件失败: {e}")
+            messagebox.showerror("导入失败", f"读取文件失败：{e}")
+            return
+
+        if not imported:
+            messagebox.showwarning("导入失败", "文件中没有有效的班级数据。")
+            return
+
+        existing_keys = {f"{item['ip']}:{item['port']}" for item in self.classlist}
+        added = 0
+        skipped = 0
+        for item in imported:
+            key = f"{item['ip']}:{item['port']}"
+            if key in existing_keys:
+                skipped += 1
+            else:
+                self.classlist.append(item)
+                existing_keys.add(key)
+                added += 1
+
+        save_classlist(self.classlist)
+        self._refresh_classlist()
+        logger.info(f"导入班级列表: 新增 {added} 条，跳过重复 {skipped} 条")
+        self.status_var.set(f"✅ 导入完成：新增 {added}，跳过 {skipped}")
+        messagebox.showinfo(
+            "导入完成",
+            f"成功导入 {added} 个班级，跳过 {skipped} 个重复项。"
+        )
+
     # ---------- 地址校验 ----------
     def _get_endpoint(self) -> str:
         ip = clean_ip(self.ip_var.get())
@@ -599,9 +704,7 @@ class NoticeSenderApp:
         if not (1 <= int(port) <= 65535):
             raise ValueError("端口号必须在 1~65535 之间。")
 
-        if ":" in ip:
-            return f"tcp://[{ip}]:{port}"
-        return f"tcp://{ip}:{port}"
+        return make_endpoint(ip, port)
 
     # ---------- 通知参数构造 ----------
     def _build_notice_args(self, title: str, body: str,
@@ -639,6 +742,8 @@ class NoticeSenderApp:
         return title, body, mask, overlay
 
     def test_connection(self):
+        if self._worker_running:
+            return
         try:
             endpoint = self._get_endpoint()
         except ValueError as e:
@@ -648,24 +753,30 @@ class NoticeSenderApp:
         timeout = int(self.config.get("ping_timeout_ms", DEFAULT_CONFIG["ping_timeout_ms"]))
         request = {"version": 0, "command": "ping", "args": []}
 
+        self._worker_running = True
         self.status_var.set("测试连接中...")
         self.test_btn.config(state="disabled")
-        self.root.update_idletasks()
+        self.send_btn.config(state="disabled")
 
-        success, msg = send_request_isolated(
-            self.context, endpoint, request, timeout, tag="测试"
-        )
+        threading.Thread(
+            target=self._test_worker,
+            args=(endpoint, request, timeout),
+            daemon=True,
+        ).start()
+        self.root.after(100, self._poll_result_queue)
 
-        if success:
-            self.status_var.set("✅ 连接正常")
-            messagebox.showinfo("连接测试", f"连接成功！\n响应: {msg}")
-        else:
-            self.status_var.set(f"❌ 连接失败: {msg}")
-            messagebox.showerror("连接测试", msg)
-
-        self.test_btn.config(state="normal")
+    def _test_worker(self, endpoint, request, timeout):
+        try:
+            success, msg = send_request_isolated(
+                self.context, endpoint, request, timeout, tag="测试"
+            )
+            self._result_queue.put(("test", success, msg))
+        except Exception as e:
+            self._result_queue.put(("test", False, f"未知错误: {e}"))
 
     def send_notice(self):
+        if self._worker_running:
+            return
         values = self._validate_notice_inputs()
         if values is None:
             return
@@ -681,25 +792,66 @@ class NoticeSenderApp:
         request = {"version": 0, "command": "notice", "args": args}
         timeout = int(self.config.get("timeout_ms", DEFAULT_CONFIG["timeout_ms"]))
 
+        self._worker_running = True
         self.status_var.set("发送中...")
         self.send_btn.config(state="disabled")
-        self.root.update_idletasks()
+        self.test_btn.config(state="disabled")
 
-        success, msg = send_request_isolated(
-            self.context, endpoint, request, timeout, tag="单发"
-        )
+        threading.Thread(
+            target=self._send_worker,
+            args=(endpoint, request, timeout),
+            daemon=True,
+        ).start()
+        self.root.after(100, self._poll_result_queue)
 
+    def _send_worker(self, endpoint, request, timeout):
+        try:
+            success, msg = send_request_isolated(
+                self.context, endpoint, request, timeout, tag="单发"
+            )
+            self._result_queue.put(("send", success, msg))
+        except Exception as e:
+            self._result_queue.put(("send", False, f"未知错误: {e}"))
+
+    def _poll_result_queue(self):
+        try:
+            while True:
+                msg = self._result_queue.get_nowait()
+                kind = msg[0]
+                if kind == "test":
+                    _, success, msg_text = msg
+                    self._on_test_result(success, msg_text)
+                    self._worker_running = False
+                    return
+                elif kind == "send":
+                    _, success, msg_text = msg
+                    self._on_send_result(success, msg_text)
+                    self._worker_running = False
+                    return
+        except queue.Empty:
+            pass
+
+        if self._worker_running:
+            self.root.after(100, self._poll_result_queue)
+
+    def _on_test_result(self, success, msg):
+        self.test_btn.config(state="normal")
+        self.send_btn.config(state="normal")
+        if success:
+            self.status_var.set("✅ 连接正常")
+            messagebox.showinfo("连接测试", f"连接成功！\n响应: {msg}")
+        else:
+            self.status_var.set(f"❌ 连接失败: {msg}")
+            messagebox.showerror("连接测试", msg)
+
+    def _on_send_result(self, success, msg):
+        self.send_btn.config(state="normal")
+        self.test_btn.config(state="normal")
         if success:
             self.status_var.set("✅ 发送成功")
-            messagebox.showinfo(
-                "发送成功",
-                f"通知已成功发送到 {self.ip_var.get().strip()}:{self.port_var.get().strip()}"
-            )
         else:
             self.status_var.set(f"❌ 发送失败: {msg}")
             messagebox.showerror("发送失败", msg)
-
-        self.send_btn.config(state="normal")
 
     # ---------- 批量发送 ----------
     def open_batch_window(self):
@@ -755,6 +907,7 @@ class BatchSendWindow(tk.Toplevel):
 
         self._batch_queue = queue.Queue()
         self._batch_active = False
+        self._stop_event = threading.Event()
 
         self.title("批量发送通知")
         self.resizable(False, False)
@@ -764,6 +917,7 @@ class BatchSendWindow(tk.Toplevel):
         except Exception:
             pass
 
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_ui()
         center_on_parent(self, parent, 620, 540)
 
@@ -796,7 +950,7 @@ class BatchSendWindow(tk.Toplevel):
         for item in self.classlist:
             key = f"{item['ip']}:{item['port']}"
             prefix = "★ " if key == default_key else "   "
-            self.listbox.insert("end", f"{prefix}{item['name']}  —  {item['ip']}:{item['port']}")
+            self.listbox.insert("end", f"{prefix}{item['name']}")
 
         self.listbox.select_set(0, "end")
 
@@ -811,6 +965,11 @@ class BatchSendWindow(tk.Toplevel):
         ttk.Label(preview_frame,
                   text=f"标题显示时长：{self.notice_mask}s     正文显示时长：{self.notice_overlay}s",
                   foreground="#666").pack(anchor="w", pady=(3, 0))
+
+        progress_frame = ttk.Frame(self)
+        progress_frame.pack(fill="x", padx=12, pady=(0, 5))
+        self.progress = ttk.Progressbar(progress_frame, mode="determinate")
+        self.progress.pack(fill="x")
 
         action_frame = ttk.Frame(self)
         action_frame.pack(fill="x", padx=12, pady=(5, 10))
@@ -853,9 +1012,12 @@ class BatchSendWindow(tk.Toplevel):
         self.send_btn.config(state="disabled")
         self.cancel_btn.config(state="disabled")
         self.listbox.config(state="disabled")
+        self.progress["maximum"] = len(selected)
+        self.progress["value"] = 0
         self.status_var.set(f"准备发送到 {len(selected)} 个班级...")
 
         self._batch_active = True
+        self._stop_event.clear()
         thread = threading.Thread(
             target=self._send_worker,
             args=(selected, request),
@@ -865,30 +1027,43 @@ class BatchSendWindow(tk.Toplevel):
         self.after(100, self._poll_batch_queue)
 
     def _send_worker(self, selected, request):
-        results = []
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         total = len(selected)
+        results = []
+        completed = 0
 
-        for i, item in enumerate(selected, 1):
-            try:
-                if not self.winfo_exists():
-                    return
-            except Exception:
-                return
-
-            endpoint = f"tcp://{item['ip']}:{item['port']}"
+        def _send_one(item):
+            if self._stop_event.is_set():
+                return None
+            endpoint = make_endpoint(item["ip"], item["port"])
             success, msg = send_request_isolated(
                 self.app.context, endpoint, request,
                 BATCH_TIMEOUT_MS, tag="批量"
             )
-            results.append({
+            return {
                 "name": item["name"],
                 "ip": item["ip"],
                 "port": item["port"],
                 "success": success,
                 "message": msg,
-            })
+            }
 
-            self._batch_queue.put(("progress", i, total, item["name"]))
+        with ThreadPoolExecutor(max_workers=BATCH_MAX_WORKERS) as executor:
+            futures = {executor.submit(_send_one, item): item for item in selected}
+            for future in as_completed(futures):
+                if self._stop_event.is_set():
+                    break
+                try:
+                    result = future.result()
+                except Exception as e:
+                    logger.exception(f"批量发送任务异常: {e}")
+                    continue
+                if result is None:
+                    continue
+                results.append(result)
+                completed += 1
+                self._batch_queue.put(("progress", completed, total, result["name"]))
 
         self._batch_queue.put(("done", results))
 
@@ -904,7 +1079,8 @@ class BatchSendWindow(tk.Toplevel):
                 msg = self._batch_queue.get_nowait()
                 if msg[0] == "progress":
                     _, current, total, name = msg
-                    self.status_var.set(f"正在发送 {current}/{total}：{name} ...")
+                    self.progress["value"] = current
+                    self.status_var.set(f"已完成 {current}/{total}：{name}")
                 elif msg[0] == "done":
                     _, results = msg
                     self._batch_active = False
@@ -916,11 +1092,16 @@ class BatchSendWindow(tk.Toplevel):
         if self._batch_active:
             self.after(100, self._poll_batch_queue)
 
+    def _on_close(self):
+        self._stop_event.set()
+        self.destroy()
+
     def _on_batch_done(self, results: list):
         try:
             self.send_btn.config(state="normal")
             self.cancel_btn.config(state="normal")
             self.listbox.config(state="normal")
+            self.progress["value"] = len(results)
         except Exception:
             pass
 
@@ -1038,6 +1219,7 @@ class BatchResultDialog(tk.Toplevel):
                             break
                 parent.lift()
                 parent.focus_set()
+                parent._start_batch()
         except Exception as e:
             logger.warning(f"重试失败项时出错: {e}")
 
